@@ -1,0 +1,936 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+#  GOBLIN MODE - Claude Code goes goblin mode
+#  Autonomous system management with a TUI
+# ============================================================
+
+VERSION="1.0.0"
+
+# --- Colors & Styles ---
+setup_colors() {
+  if [[ -t 1 ]] && [[ "${CFG_HEADLESS:-false}" != "true" ]] || [[ "${FORCE_COLOR:-}" == "true" ]]; then
+    BOLD=$'\e[1m'  DIM=$'\e[2m'  RESET=$'\e[0m'
+    RED=$'\e[31m'  GREEN=$'\e[32m'  YELLOW=$'\e[33m'
+    BLUE=$'\e[34m'  MAGENTA=$'\e[35m'  CYAN=$'\e[36m'  WHITE=$'\e[37m'
+  else
+    BOLD="" DIM="" RESET="" RED="" GREEN="" YELLOW="" BLUE="" MAGENTA="" CYAN="" WHITE=""
+  fi
+}
+
+# --- Default Configuration ---
+CFG_MODE="mayhem"
+CFG_MODEL=""
+CFG_REQUEST=""
+CFG_VERBOSE=false
+CFG_HEADLESS=false
+CFG_DRY_RUN=false
+CFG_LOG_DIR="$HOME/goblin-logs"
+CFG_CHAOS=3
+
+# --- Runtime State ---
+ITERATION=0
+PAUSED=false
+declare -a STATUS_LINES=()
+declare -a HISTORY_LINES=()
+TERM_W=80
+TERM_H=24
+
+# --- Mode Prompts (loaded from modes.conf) ---
+declare -A MODE_PROMPTS=()
+declare -a MODE_NAMES=()
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODES_FILE="${MODES_FILE:-$SCRIPT_DIR/modes.conf}"
+
+load_modes() {
+  [[ -f "$MODES_FILE" ]] || { echo "Error: modes.conf not found at $MODES_FILE"; exit 1; }
+  local current_mode=""
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^\[([a-zA-Z0-9_-]+)\] ]]; then
+      current_mode="${BASH_REMATCH[1]}"
+      MODE_NAMES+=("$current_mode")
+    elif [[ -n "$current_mode" && "$line" =~ ^prompt[[:space:]]*=[[:space:]]*(.*) ]]; then
+      MODE_PROMPTS[$current_mode]="${BASH_REMATCH[1]}"
+    fi
+  done < "$MODES_FILE"
+}
+
+load_modes
+
+declare -A CHAOS_DESC=(
+  [1]="Extremely conservative. Minimal, low-risk changes only."
+  [2]="Somewhat conservative. Small improvements, avoid major changes."
+  [3]="Balanced. Meaningful improvements, test everything."
+  [4]="Aggressive. Significant changes welcome, new services OK."
+  [5]="Maximum chaos. Overhaul subsystems. Go hard."
+)
+
+declare -A CHAOS_LABEL=(
+  [1]="1 coward"
+  [2]="2 careful"
+  [3]="3 balanced"
+  [4]="4 unhinged"
+  [5]="5 GOBLIN"
+)
+
+# --- Config File (~/.goblinrc) ---
+CONFIG_FILE="$HOME/.goblinrc"
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+    key="${key// /}"
+    value="${value%%#*}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      mode)    CFG_MODE="$value" ;;
+      model)   CFG_MODEL="$value" ;;
+      request) CFG_REQUEST="$value" ;;
+      verbose) CFG_VERBOSE="$value" ;;
+      dry_run) CFG_DRY_RUN="$value" ;;
+      chaos)   CFG_CHAOS="$value" ;;
+      log_dir) CFG_LOG_DIR="$value" ;;
+    esac
+  done < "$CONFIG_FILE"
+}
+
+save_config() {
+  cat > "$CONFIG_FILE" << EOF
+# goblin mode config
+mode=$CFG_MODE
+model=$CFG_MODEL
+request=$CFG_REQUEST
+verbose=$CFG_VERBOSE
+dry_run=$CFG_DRY_RUN
+chaos=$CFG_CHAOS
+log_dir=$CFG_LOG_DIR
+EOF
+}
+
+# --- Sudo Helper ---
+run_sudo() {
+  local action="${1:-}"
+  local sudo_script="$SCRIPT_DIR/claude-sudo.sh"
+
+  if [[ ! -x "$sudo_script" ]]; then
+    echo "Error: claude-sudo.sh not found at $sudo_script"
+    exit 1
+  fi
+
+  case "$action" in
+    status)
+      "$sudo_script" status
+      return
+      ;;
+    on)
+      echo "This will grant passwordless sudo for whitelisted system commands"
+      echo "(apt, systemctl, ufw, docker, etc)."
+      echo ""
+      read -rp "Enable sudo access? [y/N] " confirm
+      [[ "$confirm" =~ ^[yY] ]] || { echo "Cancelled."; return 1; }
+      "$sudo_script" on
+      ;;
+    off)
+      read -rp "Revoke sudo access? [y/N] " confirm
+      [[ "$confirm" =~ ^[yY] ]] || { echo "Cancelled."; return 1; }
+      "$sudo_script" off
+      ;;
+    add)
+      shift 2>/dev/null || true
+      echo "Error: use './claude-sudo.sh add /path/to/cmd' directly"
+      return 1
+      ;;
+    remove)
+      shift 2>/dev/null || true
+      echo "Error: use './claude-sudo.sh remove /path/to/cmd' directly"
+      return 1
+      ;;
+    *)
+      echo "Usage: goblin --sudo {on|off|status}"
+      return 1
+      ;;
+  esac
+}
+
+# --- Argument Parsing ---
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -m|--mode)     CFG_MODE="$2"; shift 2 ;;
+      -M|--model)    CFG_MODEL="$2"; shift 2 ;;
+      -r|--request)  CFG_REQUEST="$2"; shift 2 ;;
+      -v|--verbose)  CFG_VERBOSE=true; shift ;;
+      -H|--headless) CFG_HEADLESS=true; shift ;;
+      -d|--dry-run)  CFG_DRY_RUN=true; shift ;;
+      -l|--log-dir)  CFG_LOG_DIR="$2"; shift 2 ;;
+      -C|--chaos)    CFG_CHAOS="$2"; shift 2 ;;
+      -h|--help)     show_help; exit 0 ;;
+      --version)     echo "goblin $VERSION"; exit 0 ;;
+      --go)          CFG_AUTO_START=true; shift ;;
+      --sudo)        run_sudo "${2:-}"; exit $? ;;
+      *)             echo "Unknown: $1"; show_help; exit 1 ;;
+    esac
+  done
+}
+
+show_help() {
+  cat << 'HELP'
+GOBLIN MODE - Claude Code goes goblin mode
+
+Usage: goblin [options]
+
+Options:
+  -m, --mode MODE       optimise | improve | install | harden | mayhem (default)
+  -M, --model MODEL     opus | sonnet | haiku | full model ID
+  -r, --request TEXT    Steer towards a specific area
+  -v, --verbose         Stream Claude output in real-time
+  -H, --headless        Skip TUI, plain terminal output
+  -d, --dry-run         Assess only, don't make changes
+  -l, --log-dir PATH    Log directory (default: ~/goblin-logs)
+  -C, --chaos 1-5       Aggression level (default: 3)
+      --go              Skip settings screen, start immediately
+      --sudo ACTION     Manage sudo access: on | off | status
+  -h, --help            Show this help
+      --version         Show version
+
+TUI Keys:
+  g          Go (start from settings screen)
+  s          Back to settings (from running screen)
+  p          Pause / resume
+  q          Quit
+
+Config: ~/.goblinrc
+Logs:   ~/goblin-logs/
+HELP
+}
+
+# ============================================================
+#  TUI RENDERING
+# ============================================================
+
+get_term_size() {
+  TERM_W=$(tput cols 2>/dev/null || echo 80)
+  TERM_H=$(tput lines 2>/dev/null || echo 24)
+}
+
+tui_init() {
+  tput smcup 2>/dev/null || true   # alternate screen
+  tput civis 2>/dev/null || true   # hide cursor
+  stty -echo 2>/dev/null || true
+  tput clear
+  trap 'get_term_size' WINCH
+}
+
+tui_cleanup() {
+  tput cnorm 2>/dev/null || true   # show cursor
+  tput rmcup 2>/dev/null || true   # restore screen
+  stty echo 2>/dev/null || true
+}
+
+# Strip ANSI codes for length calculation
+strip_ansi() {
+  echo -e "$1" | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+# Truncate a string containing ANSI codes to max visible chars
+_TRUNCATED=""
+truncate_ansi() {
+  local str="$1" max="$2"
+  _TRUNCATED=""
+  local vis=0 i=0 len=${#str} c
+  while (( i < len )); do
+    c="${str:i:1}"
+    if [[ "$c" == $'\e' ]]; then
+      _TRUNCATED+="$c"; ((i++))
+      while (( i < len )); do
+        c="${str:i:1}"
+        _TRUNCATED+="$c"; ((i++))
+        [[ "$c" =~ [a-zA-Z] ]] && break
+      done
+    else
+      (( vis >= max )) && return 0
+      _TRUNCATED+="$c"
+      ((vis++))
+      ((i++))
+    fi
+  done
+}
+
+# Print a line within a box, left-aligned, padded to width
+# Truncates text that would overflow the right border
+boxline() {
+  local w=$1 text="$2"
+  local plain
+  plain=$(strip_ansi "$text")
+  local maxw=$((w - 2))
+  if (( ${#plain} > maxw )); then
+    truncate_ansi "$text" $((maxw - 1))
+    text="${_TRUNCATED}${RESET}…"
+    plain=$(strip_ansi "$text")
+  fi
+  local pad=$((w - ${#plain} - 2))
+  ((pad < 0)) && pad=0
+  printf "\xe2\x94\x82 %s%*s\xe2\x94\x82\n" "$text" "$pad" ""
+}
+
+# Horizontal border: style = top, mid, bot
+boxrule() {
+  local w=$1 style="${2:-mid}"
+  local left right
+  case "$style" in
+    top) left=$'\xe2\x94\x8c' right=$'\xe2\x94\x90' ;;
+    mid) left=$'\xe2\x94\x9c' right=$'\xe2\x94\xa4' ;;
+    bot) left=$'\xe2\x94\x94' right=$'\xe2\x94\x98' ;;
+  esac
+  local fill=""
+  for ((i=0; i<w; i++)); do fill+=$'\xe2\x94\x80'; done
+  printf "%s%s%s\n" "$left" "$fill" "$right"
+}
+
+# ============================================================
+#  SETTINGS SCREEN
+# ============================================================
+
+draw_settings_screen() {
+  local sel=$1
+  local w=50
+  ((TERM_W < 54)) && w=$((TERM_W - 4))
+
+  local fields=("mode" "model" "request" "verbose" "dry-run" "chaos" "log-dir")
+  local values=(
+    "$CFG_MODE"
+    "${CFG_MODEL:-(default)}"
+    "${CFG_REQUEST:-(none)}"
+    "$CFG_VERBOSE"
+    "$CFG_DRY_RUN"
+    "${CHAOS_LABEL[$CFG_CHAOS]}"
+    "$CFG_LOG_DIR"
+  )
+
+  local start_row=$(( (TERM_H - ${#fields[@]} - 8) / 2 ))
+  ((start_row < 0)) && start_row=0
+  local start_col=$(( (TERM_W - w - 2) / 2 ))
+  ((start_col < 0)) && start_col=0
+
+  tput clear
+  local row=$start_row
+
+  tput cup $row $start_col; boxrule $w top; ((row++))
+  tput cup $row $start_col; boxline $w "${BOLD}${GREEN} GOBLIN MODE ${RESET}${DIM}settings${RESET}"; ((row++))
+  tput cup $row $start_col; boxrule $w mid; ((row++))
+  tput cup $row $start_col; boxline $w ""; ((row++))
+
+  for i in "${!fields[@]}"; do
+    local marker="  "
+    if ((i == sel)); then
+      marker="${BOLD}${CYAN}> ${RESET}"
+    fi
+    local label
+    printf -v label "%-10s" "${fields[$i]}"
+    local val="${values[$i]}"
+    local line="${marker}${label} ${YELLOW}${val}${RESET}"
+    tput cup $row $start_col; boxline $w "$line"; ((row++))
+  done
+
+  tput cup $row $start_col; boxline $w ""; ((row++))
+  tput cup $row $start_col; boxrule $w mid; ((row++))
+  tput cup $row $start_col; boxline $w " ${BOLD}g${RESET}o  ${BOLD}q${RESET}uit  ${BOLD}s${RESET}ave  ${DIM}enter=edit arrows=nav${RESET}"; ((row++))
+  tput cup $row $start_col; boxrule $w bot
+}
+
+# Edit a field: cycle for enums, free text for strings
+edit_field() {
+  local idx=$1
+  case $idx in
+    0) # mode - cycle through modes loaded from modes.conf
+      local ci=0
+      for i in "${!MODE_NAMES[@]}"; do [[ "${MODE_NAMES[$i]}" == "$CFG_MODE" ]] && ci=$i; done
+      CFG_MODE="${MODE_NAMES[$(( (ci + 1) % ${#MODE_NAMES[@]} ))]}"
+      ;;
+    1) # model - cycle
+      local models=("" "opus" "sonnet" "haiku")
+      local ci=0
+      for i in "${!models[@]}"; do [[ "${models[$i]}" == "$CFG_MODEL" ]] && ci=$i; done
+      CFG_MODEL="${models[$(( (ci + 1) % ${#models[@]} ))]}"
+      ;;
+    2) # request - free text
+      tput cnorm
+      tput cup $((TERM_H - 2)) 0
+      printf "${BOLD}request:${RESET} "
+      stty echo
+      local input; read -r input
+      stty -echo
+      tput civis
+      CFG_REQUEST="$input"
+      ;;
+    3) # verbose - toggle
+      [[ "$CFG_VERBOSE" == "true" ]] && CFG_VERBOSE=false || CFG_VERBOSE=true
+      ;;
+    4) # dry-run - toggle
+      [[ "$CFG_DRY_RUN" == "true" ]] && CFG_DRY_RUN=false || CFG_DRY_RUN=true
+      ;;
+    5) # chaos - cycle 1-5
+      CFG_CHAOS=$(( (CFG_CHAOS % 5) + 1 ))
+      ;;
+    6) # log-dir - free text
+      tput cnorm
+      tput cup $((TERM_H - 2)) 0
+      printf "${BOLD}log-dir:${RESET} "
+      stty echo
+      local input; read -r input
+      stty -echo
+      tput civis
+      [[ -n "$input" ]] && CFG_LOG_DIR="$input"
+      ;;
+  esac
+}
+
+settings_loop() {
+  local sel=0 num_fields=7
+
+  while true; do
+    get_term_size
+    draw_settings_screen $sel
+
+    local key
+    read -rsn1 key
+
+    if [[ "$key" == $'\x1b' ]]; then
+      read -rsn2 -t 0.1 key || true
+      case "$key" in
+        "[A") ((sel > 0)) && ((sel--)) ;;
+        "[B") ((sel < num_fields - 1)) && ((sel++)) ;;
+      esac
+      continue
+    fi
+
+    case "$key" in
+      g|G) return 0 ;;
+      q|Q) return 1 ;;
+      s|S) save_config ;;
+      "")  edit_field $sel ;;
+    esac
+  done
+}
+
+# ============================================================
+#  RUNNING SCREEN
+# ============================================================
+
+LAST_RENDERED=""
+
+draw_running_screen() {
+  # Build the frame into a buffer, only write if changed (prevents flicker)
+  local w=70
+  ((TERM_W < 74)) && w=$((TERM_W - 4))
+  local col=$(( (TERM_W - w - 2) / 2 ))
+  ((col < 0)) && col=0
+
+  local buf=""
+  local row=0
+
+  # Header
+  buf+="$(tput cup $row $col)$(boxrule $w top)"; ((row++))
+
+  local title="${BOLD}${GREEN} GOBLIN MODE ${RESET}${DIM}running${RESET}"
+  buf+="$(tput cup $row $col)$(boxline $w "$title")"; ((row++))
+
+  local info="mode:${BOLD}${CFG_MODE}${RESET} model:${BOLD}${CFG_MODEL:-default}${RESET} chaos:${BOLD}${CHAOS_LABEL[$CFG_CHAOS]}${RESET} iter:${BOLD}${ITERATION}${RESET}"
+  [[ "$PAUSED" == "true" ]] && info+="  ${YELLOW}${BOLD}PAUSED${RESET}"
+  [[ "$CFG_DRY_RUN" == "true" ]] && info+="  ${MAGENTA}DRY-RUN${RESET}"
+  buf+="$(tput cup $row $col)$(boxline $w " $info")"; ((row++))
+
+  if [[ -n "$CFG_REQUEST" ]]; then
+    buf+="$(tput cup $row $col)$(boxline $w " ${DIM}request:${RESET} ${CYAN}${CFG_REQUEST}${RESET}")"; ((row++))
+  fi
+
+  buf+="$(tput cup $row $col)$(boxrule $w mid)"; ((row++))
+
+  # Status area
+  local status_h=$(( (TERM_H - row - 14) / 2 ))
+  ((status_h < 4)) && status_h=4
+  ((status_h > 12)) && status_h=12
+
+  local slen=${#STATUS_LINES[@]}
+  local sstart=$((slen - status_h))
+  ((sstart < 0)) && sstart=0
+
+  for ((i=sstart; i<slen; i++)); do
+    buf+="$(tput cup $row $col)$(boxline $w " ${STATUS_LINES[$i]}")"; ((row++))
+  done
+  local sfill=$((status_h - (slen - sstart)))
+  for ((i=0; i<sfill; i++)); do
+    buf+="$(tput cup $row $col)$(boxline $w "")"; ((row++))
+  done
+
+  # History
+  buf+="$(tput cup $row $col)$(boxrule $w mid)"; ((row++))
+  buf+="$(tput cup $row $col)$(boxline $w "${BOLD} HISTORY${RESET}")"; ((row++))
+
+  local hist_h=$((TERM_H - row - 4))
+  ((hist_h < 3)) && hist_h=3
+  ((hist_h > 12)) && hist_h=12
+
+  local hlen=${#HISTORY_LINES[@]}
+  local hstart=$((hlen - hist_h))
+  ((hstart < 0)) && hstart=0
+
+  for ((i=hstart; i<hlen; i++)); do
+    buf+="$(tput cup $row $col)$(boxline $w " ${HISTORY_LINES[$i]}")"; ((row++))
+  done
+  local hfill=$((hist_h - (hlen - hstart)))
+  for ((i=0; i<hfill; i++)); do
+    buf+="$(tput cup $row $col)$(boxline $w "")"; ((row++))
+  done
+
+  # Footer
+  buf+="$(tput cup $row $col)$(boxrule $w mid)"; ((row++))
+  buf+="$(tput cup $row $col)$(boxline $w " ${BOLD}q${RESET}uit  ${BOLD}p${RESET}ause  ${BOLD}s${RESET}ettings")"; ((row++))
+  buf+="$(tput cup $row $col)$(boxrule $w bot)"
+
+  # Only repaint if content changed
+  if [[ "$buf" != "$LAST_RENDERED" ]]; then
+    printf '%s' "$buf"
+    LAST_RENDERED="$buf"
+  fi
+}
+
+# ============================================================
+#  ENGINE
+# ============================================================
+
+build_prompt() {
+  local history=""
+  [[ -f "$CFG_LOG_DIR/history.md" ]] && history=$(cat "$CFG_LOG_DIR/history.md") || history="No previous work done yet."
+
+  local prompt="You are autonomously managing a home server.
+
+MODE: ${CFG_MODE^^}
+${MODE_PROMPTS[$CFG_MODE]}
+
+AGGRESSION: ${CFG_CHAOS}/5 — ${CHAOS_DESC[$CFG_CHAOS]}"
+
+  [[ -n "$CFG_REQUEST" ]] && prompt+="
+
+USER REQUEST: Focus specifically on: ${CFG_REQUEST}"
+
+  [[ "$CFG_DRY_RUN" == "true" ]] && prompt+="
+
+DRY RUN: Do NOT execute changes. Only assess and report what you WOULD do."
+
+  prompt+="
+
+PREVIOUS WORK:
+${history}
+
+INSTRUCTIONS:
+1. Assess the current system state
+2. Pick ONE high-priority task
+3. Implement it
+4. TEST and VERIFY it actually works (check service status, curl endpoints, run smoke tests)
+5. If the test fails, fix or rollback before reporting
+6. Explain to the user what you did and how they interact with it
+
+Output your summary in EXACTLY this format:
+TASK: what you did (one line)
+RESULT: success | partial | failure
+VALIDATION: how you tested it and what the test showed
+USAGE: commands, URLs, config paths the user needs to know
+NOTES: important info (passwords, ports, breaking changes) or 'none'
+NEXT: what to tackle next iteration"
+
+  printf '%s' "$prompt"
+}
+
+run_iteration_cmd() {
+  local prompt
+  prompt=$(build_prompt)
+
+  local -a cmd=(claude -p "$prompt" --dangerously-skip-permissions)
+  [[ -n "$CFG_MODEL" ]] && cmd+=(--model "$CFG_MODEL")
+
+  "${cmd[@]}" 2>&1
+}
+
+extract_field() {
+  local output="$1" field="$2"
+  # Match field at start of line or after whitespace (Claude may indent)
+  echo "$output" | grep -m1 -oP "(?:^|\s)${field}:\s*\K.*" || echo ""
+}
+
+log_iteration() {
+  local output="$1"
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+  mkdir -p "$CFG_LOG_DIR"
+
+  local task result validation usage notes next
+  task=$(extract_field "$output" "TASK")
+  result=$(extract_field "$output" "RESULT")
+  validation=$(extract_field "$output" "VALIDATION")
+  usage=$(extract_field "$output" "USAGE")
+  notes=$(extract_field "$output" "NOTES")
+  next=$(extract_field "$output" "NEXT")
+
+  {
+    echo "## Iteration $ITERATION — $timestamp"
+    echo "- **Task:** $task"
+    echo "- **Result:** $result"
+    echo "- **Validation:** $validation"
+    echo "- **Usage:** $usage"
+    [[ -n "$notes" && "$notes" != "none" ]] && echo "- **Notes:** $notes"
+    echo "- **Next:** $next"
+    echo ""
+  } >> "$CFG_LOG_DIR/history.md"
+
+  echo "$output" > "$CFG_LOG_DIR/iteration-${ITERATION}-raw.log"
+  echo "[$timestamp] iter=$ITERATION result=$result task=$task" >> "$CFG_LOG_DIR/goblin.log"
+}
+
+add_history() {
+  local result="$1" task="$2" validation="$3" usage="$4"
+  local mark
+  case "$result" in
+    success*)  mark="${GREEN}OK${RESET}" ;;
+    partial*)  mark="${YELLOW}~~${RESET}" ;;
+    failure*)  mark="${RED}XX${RESET}" ;;
+    *)         mark="${DIM}??${RESET}" ;;
+  esac
+  HISTORY_LINES+=("${mark}  ${ITERATION}. ${task}")
+  [[ -n "$validation" ]] && HISTORY_LINES+=("    ${DIM}Validated: ${validation}${RESET}")
+  [[ -n "$usage" ]] && HISTORY_LINES+=("    ${DIM}Usage: ${usage}${RESET}")
+}
+
+check_done() {
+  local output="$1"
+  echo "$output" | grep -qi "nothing meaningful left\|no further improvements\|fully optimized\|fully evolved" && return 0
+  return 1
+}
+
+# ============================================================
+#  SPINNER
+# ============================================================
+
+SPINNER_PID=""
+
+start_spinner() {
+  local msg="${1:-Working}"
+  (
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local i=0
+    while true; do
+      printf "\r  ${CYAN}${frames[$i]}${RESET} %s..." "$msg" >&2
+      i=$(( (i + 1) % ${#frames[@]} ))
+      sleep 0.1
+    done
+  ) &
+  SPINNER_PID=$!
+}
+
+stop_spinner() {
+  [[ -n "$SPINNER_PID" ]] && kill "$SPINNER_PID" 2>/dev/null && wait "$SPINNER_PID" 2>/dev/null || true
+  SPINNER_PID=""
+  printf "\r\033[K" >&2
+}
+
+# ============================================================
+#  HEADLESS LOOP
+# ============================================================
+
+headless_loop() {
+  echo ""
+  echo "  ${BOLD}${GREEN}GOBLIN MODE${RESET} ${DIM}(headless)${RESET}"
+  echo "  mode: ${BOLD}$CFG_MODE${RESET}  model: ${BOLD}${CFG_MODEL:-default}${RESET}  chaos: ${BOLD}$CFG_CHAOS${RESET}"
+  [[ -n "$CFG_REQUEST" ]] && echo "  request: ${CYAN}$CFG_REQUEST${RESET}"
+  [[ "$CFG_DRY_RUN" == "true" ]] && echo "  ${MAGENTA}DRY RUN — no changes will be made${RESET}"
+  echo ""
+
+  while true; do
+    ITERATION=$((ITERATION + 1))
+    local ts
+    ts=$(date '+%H:%M:%S')
+
+    echo "${BOLD}--- iteration $ITERATION [$ts] ---${RESET}"
+
+    local output
+    if [[ "$CFG_VERBOSE" == "true" ]]; then
+      # Stream and capture
+      local tmpfile
+      tmpfile=$(mktemp)
+      run_iteration_cmd | tee "$tmpfile"
+      output=$(cat "$tmpfile")
+      rm -f "$tmpfile"
+    else
+      start_spinner "Iteration $ITERATION"
+      output=$(run_iteration_cmd)
+      stop_spinner
+    fi
+
+    local task result validation usage notes
+    task=$(extract_field "$output" "TASK")
+    result=$(extract_field "$output" "RESULT")
+    validation=$(extract_field "$output" "VALIDATION")
+    usage=$(extract_field "$output" "USAGE")
+    notes=$(extract_field "$output" "NOTES")
+
+    local rc="$GREEN"
+    [[ "$result" == *partial* ]] && rc="$YELLOW"
+    [[ "$result" == *failure* ]] && rc="$RED"
+
+    echo "  ${BOLD}TASK${RESET}       $task"
+    echo "  ${BOLD}RESULT${RESET}     ${rc}${result}${RESET}"
+    echo "  ${BOLD}VALIDATION${RESET} $validation"
+    echo "  ${BOLD}USAGE${RESET}      $usage"
+    [[ -n "$notes" && "$notes" != "none" ]] && echo "  ${BOLD}NOTES${RESET}      $notes"
+    echo ""
+
+    log_iteration "$output"
+
+    if check_done "$output"; then
+      echo "${GREEN}Server fully evolved. Stopping.${RESET}"
+      break
+    fi
+  done
+}
+
+# ============================================================
+#  TUI LOOP
+# ============================================================
+
+CLAUDE_PID=""
+
+kill_claude() {
+  if [[ -n "$CLAUDE_PID" ]] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    kill "$CLAUDE_PID" 2>/dev/null
+    wait "$CLAUDE_PID" 2>/dev/null || true
+    CLAUDE_PID=""
+  fi
+}
+
+# Read a keypress, handling escape sequences. Sets TUI_KEY.
+# Returns 1 if no key was pressed within the timeout.
+read_tui_key() {
+  TUI_KEY=""
+  local key
+  read -rsn1 -t 0.5 key || return 1
+  if [[ "$key" == $'\x1b' ]]; then
+    read -rsn2 -t 0.1 key || true
+  fi
+  TUI_KEY="$key"
+  return 0
+}
+
+# Handle a keypress during the run loop. Returns:
+#   0 = handled, continue
+#   10 = back to settings
+#   11 = quit
+handle_run_key() {
+  local key="$1"
+  case "$key" in
+    p|P) [[ "$PAUSED" == "true" ]] && PAUSED=false || PAUSED=true ;;
+    s|S) return 10 ;;
+    q|Q) return 11 ;;
+  esac
+  return 0
+}
+
+tui_run_loop() {
+  STATUS_LINES=()
+  LAST_RENDERED=""
+  tput clear
+
+  while true; do
+    # Handle pause — block on input until unpaused
+    while [[ "$PAUSED" == "true" ]]; do
+      draw_running_screen
+      if read_tui_key; then
+        handle_run_key "$TUI_KEY" || {
+          local rc=$?
+          kill_claude
+          [[ $rc -eq 10 ]] && return 0
+          return 1
+        }
+      fi
+    done
+
+    ITERATION=$((ITERATION + 1))
+    STATUS_LINES=()
+    STATUS_LINES+=("${CYAN}> Starting iteration ${ITERATION}...${RESET}")
+    STATUS_LINES+=("${DIM}> Assessing system, picking task, implementing...${RESET}")
+    draw_running_screen
+
+    # Run Claude in background so we can handle input
+    local tmpfile
+    tmpfile=$(mktemp)
+    run_iteration_cmd > "$tmpfile" 2>&1 &
+    CLAUDE_PID=$!
+
+    local dots=0
+    local last_line_count=0
+    # Poll for completion + input
+    while kill -0 "$CLAUDE_PID" 2>/dev/null; do
+      if read_tui_key; then
+        handle_run_key "$TUI_KEY" || {
+          local rc=$?
+          kill_claude
+          rm -f "$tmpfile"
+          [[ $rc -eq 10 ]] && return 0
+          return 1
+        }
+      fi
+
+      # Update status area
+      dots=$(( (dots + 1) % 4 ))
+      local anim=""
+      for ((d=0; d<dots; d++)); do anim+="."; done
+
+      if [[ "$CFG_VERBOSE" == "true" && -f "$tmpfile" ]]; then
+        # Show live output from Claude in the status area
+        local current_lines
+        current_lines=$(wc -l < "$tmpfile" 2>/dev/null || echo 0)
+        ((current_lines > last_line_count)) && last_line_count=$current_lines
+        # Always rebuild with current animation tick and latest tail lines
+        STATUS_LINES=("${CYAN}> Iteration ${ITERATION} running${anim}${RESET}")
+        while IFS= read -r line; do
+          [[ ${#line} -gt 60 ]] && line="${line:0:57}..."
+          [[ -n "$line" ]] && STATUS_LINES+=("${DIM}  ${line}${RESET}")
+        done < <(tail -5 "$tmpfile" 2>/dev/null)
+      else
+        STATUS_LINES=("${CYAN}> Iteration ${ITERATION} running${anim}${RESET}")
+      fi
+
+      if [[ "$PAUSED" == "true" ]]; then
+        STATUS_LINES+=("${YELLOW}> Paused (Claude still finishing current task)${RESET}")
+      fi
+      draw_running_screen
+    done
+
+    wait "$CLAUDE_PID" 2>/dev/null || true
+    CLAUDE_PID=""
+
+    local output
+    output=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+
+    # Parse results
+    local task result validation usage notes
+    task=$(extract_field "$output" "TASK")
+    result=$(extract_field "$output" "RESULT")
+    validation=$(extract_field "$output" "VALIDATION")
+    usage=$(extract_field "$output" "USAGE")
+    notes=$(extract_field "$output" "NOTES")
+
+    # Update status
+    STATUS_LINES=()
+    local rc="${GREEN}"; [[ "$result" == *partial* ]] && rc="${YELLOW}"; [[ "$result" == *failure* ]] && rc="${RED}"
+    STATUS_LINES+=("${BOLD}> Task: ${task}${RESET}")
+    STATUS_LINES+=("${rc}> Result: ${result}${RESET}")
+    [[ -n "$validation" ]] && STATUS_LINES+=("${GREEN}> Validated: ${validation}${RESET}")
+    [[ -n "$usage" ]] && STATUS_LINES+=("${BLUE}> Usage: ${usage}${RESET}")
+    [[ -n "$notes" && "$notes" != "none" ]] && STATUS_LINES+=("${YELLOW}> Notes: ${notes}${RESET}")
+
+    add_history "$result" "$task" "$validation" "$usage"
+    log_iteration "$output"
+    draw_running_screen
+
+    # Check for done
+    if check_done "$output"; then
+      STATUS_LINES+=("")
+      STATUS_LINES+=("${GREEN}${BOLD}> Server fully evolved!${RESET}")
+      draw_running_screen
+      read -rsn1 || true
+      return 1
+    fi
+
+    # If paused during iteration, stay paused for next loop
+  done
+}
+
+tui_loop() {
+  tui_init
+  get_term_size
+
+  # Skip settings if --go was passed
+  if [[ "${CFG_AUTO_START:-false}" != "true" ]]; then
+    while true; do
+      if ! settings_loop; then
+        tui_cleanup
+        echo "Goblin mode cancelled."
+        return
+      fi
+
+      # Run, then loop back to settings or quit
+      if ! tui_run_loop; then
+        tui_cleanup
+        print_summary
+        return
+      fi
+      # tui_run_loop returned 0 = back to settings
+    done
+  else
+    # Auto-start: go straight to running
+    if ! tui_run_loop; then
+      tui_cleanup
+      print_summary
+      return
+    fi
+    tui_cleanup
+    print_summary
+  fi
+}
+
+# ============================================================
+#  WRAPUP
+# ============================================================
+
+print_summary() {
+  echo ""
+  echo "  ${BOLD}${GREEN}GOBLIN MODE COMPLETE${RESET}"
+  echo "  Iterations: $ITERATION"
+  echo "  Logs: $CFG_LOG_DIR/"
+  echo ""
+}
+
+cleanup() {
+  kill_claude
+  stop_spinner
+  if [[ "$CFG_HEADLESS" != "true" ]]; then
+    tui_cleanup
+  fi
+  print_summary
+  exit 0
+}
+
+# ============================================================
+#  ENTRY POINT
+# ============================================================
+
+main() {
+  load_config
+  parse_args "$@"
+  setup_colors
+
+  # Validate selected mode exists
+  if [[ -z "${MODE_PROMPTS[$CFG_MODE]+x}" ]]; then
+    echo "Error: unknown mode '$CFG_MODE'"
+    echo "Available modes: ${MODE_NAMES[*]}"
+    exit 1
+  fi
+
+  mkdir -p "$CFG_LOG_DIR"
+  trap cleanup SIGINT SIGTERM
+
+  if [[ "$CFG_HEADLESS" == "true" ]]; then
+    headless_loop
+  else
+    tui_loop
+  fi
+}
+
+main "$@"
