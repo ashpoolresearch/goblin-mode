@@ -559,8 +559,8 @@ run_iteration_cmd() {
 
 extract_field() {
   local output="$1" field="$2"
-  # Match field at start of line or after whitespace (Claude may indent)
-  echo "$output" | grep -m1 -oP "(?:^|\s)${field}:\s*\K.*" || echo ""
+  # Match FIELD: or **FIELD:** (markdown bold) at start of line or after whitespace
+  printf '%s\n' "$output" | grep -m1 -oP "(?:^|\s)\*{0,2}${field}\*{0,2}:\s*\K.*" || echo ""
 }
 
 log_iteration() {
@@ -794,13 +794,18 @@ tui_run_loop() {
         # Show live output from Claude in the status area
         local current_lines
         current_lines=$(wc -l < "$tmpfile" 2>/dev/null || echo 0)
-        ((current_lines > last_line_count)) && last_line_count=$current_lines
-        # Always rebuild with current animation tick and latest tail lines
-        STATUS_LINES=("${CYAN}> Iteration ${ITERATION} running${anim}${RESET}")
-        while IFS= read -r line; do
-          [[ ${#line} -gt 60 ]] && line="${line:0:57}..."
-          [[ -n "$line" ]] && STATUS_LINES+=("${DIM}  ${line}${RESET}")
-        done < <(tail -5 "$tmpfile" 2>/dev/null)
+        if ((current_lines > last_line_count)); then
+          # New output — rebuild content from latest tail lines
+          STATUS_LINES=("${CYAN}> Iteration ${ITERATION} running${anim}${RESET}")
+          while IFS= read -r line; do
+            [[ ${#line} -gt 60 ]] && line="${line:0:57}..."
+            [[ -n "$line" ]] && STATUS_LINES+=("${DIM}  ${line}${RESET}")
+          done < <(tail -5 "$tmpfile" 2>/dev/null)
+          last_line_count=$current_lines
+        else
+          # No new output — just tick the animation header, leave content alone
+          STATUS_LINES[0]="${CYAN}> Iteration ${ITERATION} running${anim}${RESET}"
+        fi
       else
         STATUS_LINES=("${CYAN}> Iteration ${ITERATION} running${anim}${RESET}")
       fi
@@ -835,7 +840,7 @@ tui_run_loop() {
     [[ -n "$usage" ]] && STATUS_LINES+=("${BLUE}> Usage: ${usage}${RESET}")
     [[ -n "$notes" && "$notes" != "none" ]] && STATUS_LINES+=("${YELLOW}> Notes: ${notes}${RESET}")
 
-    add_history "$result" "$task" "$validation" "$usage"
+    [[ -n "$task" ]] && add_history "$result" "$task" "$validation" "$usage"
     log_iteration "$output"
     draw_running_screen
 
